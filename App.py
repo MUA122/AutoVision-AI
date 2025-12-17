@@ -1,287 +1,193 @@
 import streamlit as st
 import pandas as pd
-import altair as alt
-from datetime import datetime
+from pathlib import Path
 
+from recommender import train_recommender, recommend
 
+# ---------------------------
+# App Config
+# ---------------------------
 st.set_page_config(
-    page_title="AutoVision AI",
+    page_title="AutoVision AI | Car Recommendation",
     page_icon="🚗",
     layout="wide",
 )
 
-# LOAD DATA
+st.title("🚗 AutoVision AI — Car Recommendation System")
+st.caption("ML-based content recommendation using vector similarity (categorical encoding + numeric scaling + cosine similarity).")
+
+DATA_PATH = "data.csv"
+
+
+# ---------------------------
+# Load dataset for UI options
+# ---------------------------
 @st.cache_data
-def load_data():
-    df = pd.read_csv("car.csv")
-
-    df["car_name"] = (
-        df["Brand"].astype(str)
-        + " "
-        + df["Model"].astype(str)
-        + " (" + df["Year"].astype(str) + ")"
-    )
-
-    df.rename(columns={
-        "Brand": "brand",
-        "Year": "year",
-        "Mileage": "km_driven",        
-        "Fuel Type": "fuel_type",
-        "Transmission": "transmission",
-        "Price": "selling_price",
-    }, inplace=True)
-
-    # car age
-    current_year = datetime.now().year
-    df["car_age"] = current_year - df["year"]
-
-    df["fuel_efficiency"] = (df["km_driven"].max() - df["km_driven"]) / 5000
-    df["fuel_efficiency"] = df["fuel_efficiency"].clip(lower=5, upper=25)
-
-    #future price
-    df["future_price"] = df["selling_price"] * 0.8
-
+def load_data(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df.columns = [c.strip() for c in df.columns]
     return df
 
 
-df = load_data()
+if not Path(DATA_PATH).exists():
+    st.error(f"Couldn't find `{DATA_PATH}` in your project folder. Please add it beside app.py.")
+    st.stop()
 
-# SIDE NAVbar
-st.sidebar.title("AutoVision AI")
-section = st.sidebar.radio(
-    "Go to:",
-    [
-        "🏁 Intro & Goals",
-        "🔮 Prediction Demo",
-        "📊 Charts & Analytics",
-        "🤝 Car Recommendation System",
-    ],
+df = load_data(DATA_PATH)
+
+# Basic checks
+required_cols = {"Price", "Year", "Brand", "Fuel Type", "Transmission"}
+missing = required_cols - set(df.columns)
+if missing:
+    st.error(f"Your dataset is missing required columns: {sorted(list(missing))}")
+    st.stop()
+
+
+# ---------------------------
+# Train / Load recommender artifacts
+# ---------------------------
+@st.cache_resource
+def ensure_artifacts():
+    # Creates artifacts if missing (safe to call on deploy)
+    train_recommender(DATA_PATH, force=False)
+    return True
+
+
+try:
+    ensure_artifacts()
+except Exception as e:
+    st.error("Failed to prepare recommendation artifacts.")
+    st.exception(e)
+    st.stop()
+
+
+# ---------------------------
+# Sidebar: User Preferences (Quiz)
+# ---------------------------
+st.sidebar.header("🧩 Your Preferences")
+
+price_min = float(max(0, df["Price"].min()))
+price_max = float(df["Price"].max())
+price_med = float(df["Price"].median())
+
+budget = st.sidebar.number_input(
+    "Budget",
+    min_value=price_min,
+    max_value=float(price_max * 2),
+    value=price_med,
+    step=max(100.0, price_max * 0.01),
 )
 
-# 1) INTRO & GOALS
-if section == "🏁 Intro & Goals":
-    st.title("AutoVision AI 🚗")
-    st.subheader("A Smart Car Analytics & Prediction Platform")
+usage_type = st.sidebar.selectbox(
+    "Usage type",
+    ["City", "Travel", "Family", "Mixed"],
+)
 
-    st.markdown(
-        """
-        **AutoVision AI** is a demo web platform built on a car dataset.
-        It aims to:
-        - Explore and visualize car data  
-        - Show example prediction outputs (price, age, efficiency, future value)  
-        - Provide a simple rule-based car recommendation experience  
-        """
-    )
+fuel_options = ["Any"] + sorted(df["Fuel Type"].dropna().astype(str).unique().tolist())
+fuel_pref = st.sidebar.selectbox("Fuel preference", fuel_options)
 
-    st.markdown("### Dataset Snapshot")
-    st.dataframe(df.head())
+trans_options = ["Any"] + sorted(df["Transmission"].dropna().astype(str).unique().tolist())
+trans_pref = st.sidebar.selectbox("Transmission preference", trans_options)
 
-# 2) PREDICTION DEMO
-elif section == "🔮 Prediction Demo":
-    st.title("Prediction Demo 🔮")
-    st.write(
-        "Choose a car from the dataset(Demo)"
-    )
+year_min = int(df["Year"].min())
+year_max = int(df["Year"].max())
 
-    car_options = df["car_name"].tolist()
-    selected_car = st.selectbox("Choose a car from the dataset:", car_options)
+year_range = st.sidebar.slider(
+    "Year range",
+    min_value=year_min,
+    max_value=year_max,
+    value=(max(year_min, year_max - 10), year_max),
+)
 
-    car_row = df[df["car_name"] == selected_car].iloc[0]
+top_k = st.sidebar.slider("Number of recommendations", min_value=3, max_value=10, value=5)
 
-    selling_price_example = float(car_row["selling_price"])
-    car_age_example = float(car_row["car_age"])
-    fuel_efficiency_example = float(car_row["fuel_efficiency"])
-    future_price_example = float(car_row["future_price"])
+st.sidebar.markdown("---")
+run_btn = st.sidebar.button("🔎 Recommend Cars")
 
-    st.markdown("### Demo Cards")
-    c1, c2, c3, c4 = st.columns(4)
 
-    with c1:
-        st.write("**Selling Price (Demo)**")
-        st.button(
-            f"{selling_price_example:,.0f} (USD)",
-            help="Example predicted selling price.",
+# ---------------------------
+# Main: Show Recommendations
+# ---------------------------
+colA, colB = st.columns([2, 1])
+
+with colA:
+    st.subheader("✅ Recommended Cars")
+
+with colB:
+    with st.expander("Dataset quick info", expanded=False):
+        st.write(f"Rows: **{len(df):,}**")
+        st.write(f"Columns: **{len(df.columns):,}**")
+        st.write("Sample columns:", ", ".join(list(df.columns[:10])) + (" ..." if len(df.columns) > 10 else ""))
+
+if run_btn:
+    try:
+        top_cars, reasons = recommend(
+            budget=float(budget),
+            usage_type=str(usage_type),
+            fuel_pref=str(fuel_pref),
+            trans_pref=str(trans_pref),
+            year_min=int(year_range[0]),
+            year_max=int(year_range[1]),
+            top_k=int(top_k),
         )
+    except Exception as e:
+        st.error("Recommendation failed.")
+        st.exception(e)
+        st.stop()
 
-    with c2:
-        st.write("**Car Age (Demo)**")
-        st.button(
-            f"{car_age_example:.1f} years",
-            help="Example predicted car age.",
-        )
+    if top_cars is None or top_cars.empty:
+        st.warning("No cars matched your filters. Try increasing budget or widening year range.")
+        st.stop()
 
-    with c3:
-        st.write("**Fuel Efficiency (Demo)**")
-        st.button(
-            f"{fuel_efficiency_example:.1f} km/L",
-            help="Example predicted fuel efficiency.",
-        )
+    # Render results
+    top_cars = top_cars.reset_index(drop=True)
 
-    with c4:
-        st.write("**Future Price (Demo)**")
-        st.button(
-            f"{future_price_example:,.0f} (USD)",
-            help="Example predicted future resale value.",
-        )
+    for i, row in top_cars.iterrows():
+        st.markdown("---")
+        left, right = st.columns([2, 1])
 
-    st.info("Right now these are static demo values based on the row data")
+        with left:
+            # car_name is generated inside recommender training
+            car_title = row.get("car_name", f"{row.get('Brand','')} {row.get('Model','')}")
+            st.markdown(f"### 🚘 {car_title}")
 
-# 3) CHARTS & ANALYTICS
-elif section == "📊 Charts & Analytics":
-    st.title("Charts & Analytics 📊")
-    st.write("Explore the dataset using filters and interactive charts.")
+            st.write(f"**Estimated Price:** {float(row['Price']):,.0f}")
+            st.write(f"**Year:** {int(row['Year'])}")
+            st.write(f"**Fuel Type:** {row.get('Fuel Type', '-')}")
+            st.write(f"**Transmission:** {row.get('Transmission', '-')}")
 
-    # Filters
-    brands = ["All"] + sorted(df["brand"].unique().tolist())
-    fuels = ["All"] + sorted(df["fuel_type"].unique().tolist())
-    transmissions = ["All"] + sorted(df["transmission"].unique().tolist())
+            # Optional fields if exist
+            if "Mileage" in row and pd.notna(row["Mileage"]):
+                try:
+                    st.write(f"**Mileage:** {float(row['Mileage']):,.0f}")
+                except:
+                    st.write(f"**Mileage:** {row['Mileage']}")
 
-    col_f1, col_f2, col_f3 = st.columns(3)
-    with col_f1:
-        selected_brand = st.selectbox("Filter by brand:", brands)
-    with col_f2:
-        selected_fuel = st.selectbox("Filter by fuel type:", fuels)
-    with col_f3:
-        selected_trans = st.selectbox("Filter by transmission:", transmissions)
+            if "Engine Size" in row and pd.notna(row["Engine Size"]):
+                st.write(f"**Engine Size:** {row['Engine Size']}")
 
-    filtered_df = df.copy()
-    if selected_brand != "All":
-        filtered_df = filtered_df[filtered_df["brand"] == selected_brand]
-    if selected_fuel != "All":
-        filtered_df = filtered_df[filtered_df["fuel_type"] == selected_fuel]
-    if selected_trans != "All":
-        filtered_df = filtered_df[filtered_df["transmission"] == selected_trans]
+            # Similarity score (added by recommender)
+            if "similarity" in row:
+                st.caption(f"Similarity score: {float(row['similarity']):.3f}")
 
-    # Chart 1: Average Selling Price by Brand
-    st.markdown("### 1) Average Selling Price by Brand (Bar Chart)")
+        with right:
+            st.markdown("**Why this car?**")
+            if i < len(reasons):
+                for r in reasons[i]:
+                    st.write(f"- {r}")
+            else:
+                st.write("- Matches your preferences closely.")
 
-    avg_price = (
-        filtered_df.groupby("brand")["selling_price"]
-        .mean()
-        .reset_index()
-        .sort_values("selling_price", ascending=False)
-    )
+            # Extra explainability if engineered columns exist
+            extra_signals = []
+            for col in ["value_score", "wear_score", "maintenance_index", "yearly_fuel_cost", "is_suv", "is_luxury"]:
+                if col in row.index and pd.notna(row[col]):
+                    extra_signals.append((col, row[col]))
 
-    bar_chart = (
-        alt.Chart(avg_price)
-        .mark_bar()
-        .encode(
-            x=alt.X("brand:N", sort="-y", title="Brand"),
-            y=alt.Y("selling_price:Q", title="Average Selling Price"),
-            tooltip=["brand", "selling_price"],
-        )
-        .properties(height=400)
-    )
-    st.altair_chart(bar_chart, use_container_width=True)
+            if extra_signals:
+                st.markdown("**Extra signals (from dataset):**")
+                for k, v in extra_signals[:6]:
+                    st.write(f"- {k}: {v}")
 
-    # Chart 2: Km Driven vs Selling Price
-    st.markdown("### 2) Km Driven vs Selling Price (Scatter Plot)")
-
-    scatter = (
-        alt.Chart(filtered_df)
-        .mark_circle(size=60, opacity=0.6)
-        .encode(
-            x=alt.X("km_driven:Q", title="Km Driven"),
-            y=alt.Y("selling_price:Q", title="Selling Price"),
-            color=alt.Color("fuel_type:N", title="Fuel Type"),
-            tooltip=["car_name", "km_driven", "selling_price"],
-        )
-        .properties(height=400)
-    )
-    st.altair_chart(scatter, use_container_width=True)
-
-# 4) CAR RECOMMENDATION SYSTEM
-elif section == "🤝 Car Recommendation System":
-    st.title("Car Recommendation System 🤝")
-    st.write(
-        "Answer a few questions and AutoVision AI will suggest some cars that match your preferences. "
-        "This is a simple rule-based demo — not a full AI recommender yet."
-    )
-
-    with st.form("recommendation_form"):
-        budget = st.number_input(
-            "Budget (same unit as Price column):",
-            min_value=1000.0,
-            max_value=float(df["selling_price"].max() * 2),
-            value=float(df["selling_price"].median()),
-            step=1000.0,
-        )
-
-        usage_type = st.selectbox(
-            "Usage type:",
-            ["City", "Travel", "Family", "Mixed"],
-        )
-
-        fuel_pref = st.selectbox(
-            "Fuel preference:",
-            ["Any"] + sorted(df["fuel_type"].unique().tolist()),
-        )
-
-        trans_pref = st.selectbox(
-            "Transmission preference:",
-            ["Any"] + sorted(df["transmission"].unique().tolist()),
-        )
-
-        year_min, year_max = int(df["year"].min()), int(df["year"].max())
-        year_range = st.slider(
-            "Preferred year range:",
-            year_min,
-            year_max,
-            (max(year_min, year_max - 10), year_max),
-        )
-
-        submitted = st.form_submit_button("Get Recommendations")
-
-    if submitted:
-        rec_df = df.copy()
-
-        rec_df = rec_df[(rec_df["year"] >= year_range[0]) & (rec_df["year"] <= year_range[1])]
-        rec_df = rec_df[rec_df["selling_price"] <= budget * 1.2]
-        if fuel_pref != "Any":
-            rec_df = rec_df[rec_df["fuel_type"] == fuel_pref]
-        if trans_pref != "Any":
-            rec_df = rec_df[rec_df["transmission"] == trans_pref]
-
-        if rec_df.empty:
-            st.warning("No cars found that match your filters. Try adjusting budget or year range.")
-        else:
-            rec_df["budget_diff"] = (rec_df["selling_price"] - budget).abs()
-            rec_df["score"] = -rec_df["budget_diff"] + rec_df["year"] * 10
-
-            top_cars = rec_df.sort_values("score", ascending=False).head(3)
-
-            st.subheader("Best-matching cars:")
-            for _, row in top_cars.iterrows():
-                st.markdown("---")
-                col1, col2 = st.columns([2, 1])
-
-                with col1:
-                    st.markdown(f"### 🚗 {row['car_name']}")
-                    st.markdown(f"**Estimated Price:** {row['selling_price']:,.0f}")
-                    st.markdown(f"**Year:** {int(row['year'])}")
-                    st.markdown(f"**Km Driven:** {int(row['km_driven']):,}")
-                    st.markdown(f"**Fuel Type:** {row['fuel_type']}")
-                    st.markdown(f"**Transmission:** {row['transmission']}")
-
-                with col2:
-                    reasons = []
-                    if row["selling_price"] <= budget:
-                        reasons.append("Fits within your budget.")
-                    else:
-                        reasons.append("Slightly above your budget but still close.")
-                    if usage_type == "City":
-                        reasons.append("Suitable for daily city driving.")
-                    elif usage_type == "Travel":
-                        reasons.append("Good option for long-distance travel.")
-                    elif usage_type == "Family":
-                        reasons.append("Suitable for family usage.")
-                    else:
-                        reasons.append("Balanced choice for mixed usage.")
-                    if fuel_pref != "Any":
-                        reasons.append("Matches your fuel preference.")
-
-                    st.markdown("**Why this car?**")
-                    for r in reasons:
-                        st.markdown(f"- {r}")
-
-            st.success("These recommendations are rule-based for demo purposes")
+else:
+    st.info("Set your preferences from the sidebar, then click **Recommend Cars**.")
